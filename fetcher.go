@@ -16,7 +16,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/mod/module"
@@ -68,7 +67,7 @@ type Fetcher interface {
 	//
 	// The returned error is nil only if all three kinds of module files
 	// are successfully downloaded.
-	Download(ctx context.Context, path, version string) (info, mod, zip io.ReadSeekCloser, err error)
+	Download(ctx context.Context, path, version, ext string) (content io.ReadSeekCloser, err error)
 }
 
 // GoFetcher implements [Fetcher] using the local Go binary.
@@ -334,7 +333,7 @@ func (gf *GoFetcher) directList(ctx context.Context, path string) (versions []st
 }
 
 // Download implements [Fetcher].
-func (gf *GoFetcher) Download(ctx context.Context, path, version string) (info, mod, zip io.ReadSeekCloser, err error) {
+func (gf *GoFetcher) Download(ctx context.Context, path, version, ext string) (content io.ReadSeekCloser, err error) {
 	if gf.initOnce.Do(gf.init); gf.initErr != nil {
 		err = gf.initErr
 		return
@@ -345,7 +344,7 @@ func (gf *GoFetcher) Download(ctx context.Context, path, version string) (info, 
 	}
 
 	var (
-		infoFile, modFile, zipFile string
+		downloadPath string
 
 		// fromProxy indicates whether the module files were fetched
 		// from an upstream proxy rather than directly using the local
@@ -358,14 +357,14 @@ func (gf *GoFetcher) Download(ctx context.Context, path, version string) (info, 
 		cleanup func()
 	)
 	if gf.skipProxy(path) {
-		infoFile, modFile, zipFile, err = gf.directDownload(ctx, path, version)
+		downloadPath, err = gf.directDownload(ctx, path, version, ext)
 	} else {
 		err = walkEnvGOPROXY(gf.envGOPROXY, func(proxy *url.URL) error {
-			infoFile, modFile, zipFile, cleanup, err = gf.proxyDownload(ctx, path, version, proxy)
+			downloadPath, cleanup, err = gf.proxyDownload(ctx, path, version, ext, proxy)
 			fromProxy = err == nil
 			return err
 		}, func() error {
-			infoFile, modFile, zipFile, err = gf.directDownload(ctx, path, version)
+			downloadPath, err = gf.directDownload(ctx, path, version, ext)
 			return err
 		})
 	}
@@ -382,81 +381,67 @@ func (gf *GoFetcher) Download(ctx context.Context, path, version string) (info, 
 		cleanup = func() {} // Avoid nil cleanup.
 	}
 
-	infoVersion, infoTime, err := unmarshalInfoFile(infoFile)
-	if err != nil {
-		return
-	}
-	err = checkModFile(modFile)
-	if err != nil {
-		return
-	}
-	err = checkZipFile(zipFile, path, version)
-	if err != nil {
-		return
-	}
-
-	// Verify against the checksum database only for proxy downloads. Direct
-	// downloads are verified by the local Go binary itself.
-	if gf.sumdbClient != nil && fromProxy {
-		err = verifyModFile(gf.sumdbClient, modFile, path, version)
+	switch ext {
+	case ".info":
+		var infoVersion string
+		var infoTime time.Time
+		infoVersion, infoTime, err = unmarshalInfoFile(downloadPath)
 		if err != nil {
 			return
 		}
-		err = verifyZipFile(gf.sumdbClient, zipFile, path, version)
+		infoContent := strings.NewReader(marshalInfo(infoVersion, infoTime))
+		content = closeDownload(infoContent, cleanup)
+		return
+	case ".mod":
+		err = checkModFile(downloadPath)
 		if err != nil {
 			return
 		}
-	}
-
-	infoContent := strings.NewReader(marshalInfo(infoVersion, infoTime))
-	modContent, err := os.Open(modFile)
-	if err != nil {
-		return
-	}
-	zipContent, err := os.Open(zipFile)
-	if err != nil {
-		modContent.Close()
-		return
-	}
-
-	var (
-		closers int32 = 3
-		closed        = func() {
-			if atomic.AddInt32(&closers, -1) == 0 {
-				cleanup()
+		if gf.sumdbClient != nil && fromProxy {
+			err = verifyModFile(gf.sumdbClient, downloadPath, path, version)
+			if err != nil {
+				return
 			}
 		}
-	)
-	infoClosedOnce := sync.OnceFunc(closed)
-	info = struct {
-		io.ReadSeeker
-		io.Closer
-	}{infoContent, closerFunc(func() error {
-		infoClosedOnce()
-		return nil
-	})}
-	modClosedOnce := sync.OnceFunc(closed)
-	mod = struct {
-		io.ReadSeeker
-		io.Closer
-	}{modContent, closerFunc(func() error {
-		defer modClosedOnce()
-		return modContent.Close()
-	})}
-	zipClosedOnce := sync.OnceFunc(closed)
-	zip = struct {
-		io.ReadSeeker
-		io.Closer
-	}{zipContent, closerFunc(func() error {
-		defer zipClosedOnce()
-		return zipContent.Close()
-	})}
+	case ".zip":
+		err = checkZipFile(downloadPath, path, version)
+		if err != nil {
+			return
+		}
+		if gf.sumdbClient != nil && fromProxy {
+			err = verifyZipFile(gf.sumdbClient, downloadPath, path, version)
+			if err != nil {
+				return
+			}
+		}
+	}
+	var tmpContent *os.File
+	tmpContent, err = os.Open(downloadPath)
+	if err != nil {
+		return
+	}
+	content = closeDownload(tmpContent, cleanup)
 	return
+}
+
+type fileContent struct {
+	io.ReadSeeker
+	io.Closer
+}
+
+func closeDownload(in io.ReadSeeker, cleanup func()) (content io.ReadSeekCloser) {
+	return &fileContent{in, closerFunc(func() (err error) {
+		if closer, ok := in.(io.Closer); ok {
+			err = closer.Close()
+		}
+		cleanup()
+		return
+	})}
 }
 
 // proxyDownload downloads the module files for the given module path and
 // version using the given proxy.
-func (gf *GoFetcher) proxyDownload(ctx context.Context, path, version string, proxy *url.URL) (infoFile, modFile, zipFile string, cleanup func(), err error) {
+func (gf *GoFetcher) proxyDownload(ctx context.Context, path, version, ext string, proxy *url.URL) (downloadPath string, cleanup func(), err error) {
 	escapedPath, err := module.EscapePath(path)
 	if err != nil {
 		return
@@ -477,15 +462,8 @@ func (gf *GoFetcher) proxyDownload(ctx context.Context, path, version string, pr
 		}
 	}()
 
-	infoFile, err = httpGetTemp(ctx, gf.httpClient, urlWithoutExt+".info", tempDir)
-	if err != nil {
-		return
-	}
-	modFile, err = httpGetTemp(ctx, gf.httpClient, urlWithoutExt+".mod", tempDir)
-	if err != nil {
-		return
-	}
-	zipFile, err = httpGetTemp(ctx, gf.httpClient, urlWithoutExt+".zip", tempDir)
+	urlWithExt := urlWithoutExt + ext
+	downloadPath, err = httpGetTemp(ctx, gf.httpClient, urlWithExt, tempDir)
 	if err != nil {
 		return
 	}
@@ -495,13 +473,25 @@ func (gf *GoFetcher) proxyDownload(ctx context.Context, path, version string, pr
 
 // directDownload downloads the module files for the given module path and
 // version using the local Go binary.
-func (gf *GoFetcher) directDownload(ctx context.Context, path, version string) (infoFile, modFile, zipFile string, err error) {
+func (gf *GoFetcher) directDownload(ctx context.Context, path, version, ext string) (downloadPath string, err error) {
 	output, err := gf.execGo(ctx, "mod", "download", "-json", path+"@"+version)
 	if err != nil {
 		return
 	}
 	var download struct{ Info, GoMod, Zip string }
-	return download.Info, download.GoMod, download.Zip, json.Unmarshal(output, &download)
+	err = json.Unmarshal(output, &download)
+	if err != nil {
+		return
+	}
+	switch ext {
+	case ".info":
+		downloadPath = download.Info
+	case ".mod":
+		downloadPath = download.GoMod
+	case ".zip":
+		downloadPath = download.Zip
+	}
+	return
 }
 
 // execGo executes the local Go binary with the given args and returns the output.
@@ -561,7 +551,7 @@ func cleanEnvGOPROXY(envGOPROXY string) (string, error) {
 	if envGOPROXY == "" || envGOPROXY == defaultEnvGOPROXY {
 		return defaultEnvGOPROXY, nil
 	}
-	var cleaned string
+	var cleaned strings.Builder
 	for envGOPROXY != "" {
 		var proxy, sep string
 		if i := strings.IndexAny(envGOPROXY, ",|"); i >= 0 {
@@ -587,12 +577,12 @@ func cleanEnvGOPROXY(envGOPROXY string) (string, error) {
 				return "", fmt.Errorf("invalid GOPROXY URL: %w", err)
 			}
 		}
-		cleaned += proxy + sep
+		cleaned.WriteString(proxy + sep)
 	}
-	if cleaned == "" {
+	if cleaned.String() == "" {
 		return "", errors.New("GOPROXY list is not the empty string, but contains no entries")
 	}
-	return cleaned, nil
+	return cleaned.String(), nil
 }
 
 // walkEnvGOPROXY walks through the proxy list parsed from the envGOPROXY.

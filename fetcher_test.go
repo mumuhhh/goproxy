@@ -945,7 +945,10 @@ func TestGoFetcherDownload(t *testing.T) {
 			gf.initOnce.Do(gf.init)
 			gf.env = append(gf.env, "GOPROXY="+proxyServer.URL+"/direct/")
 
-			info, mod, zip, err := gf.Download(t.Context(), tt.path, tt.version)
+			info, err1 := gf.Download(t.Context(), tt.path, tt.version, ".info")
+			mod, err2 := gf.Download(t.Context(), tt.path, tt.version, ".mod")
+			zip, err3 := gf.Download(t.Context(), tt.path, tt.version, ".zip")
+			err = firstError(err1, err2, err3)
 			if tt.wantErr != nil {
 				if err == nil {
 					t.Fatal("expected error")
@@ -1097,7 +1100,13 @@ func TestGoFetcherProxyDownload(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error %v", err)
 			}
-			infoFile, modFile, zipFile, cleanup, err := gf.proxyDownload(t.Context(), tt.path, tt.version, proxy)
+			infoFile, cleanup1, err1 := gf.proxyDownload(t.Context(), tt.path, tt.version, ".info", proxy)
+			modFile, cleanup02, err2 := gf.proxyDownload(t.Context(), tt.path, tt.version, ".mod", proxy)
+			zipFile, cleanup03, err3 := gf.proxyDownload(t.Context(), tt.path, tt.version, ".zip", proxy)
+			err = firstError(err1, err2, err3)
+			cleanup := func() {
+				cleanupFuncs(cleanup1, cleanup02, cleanup03)
+			}
 			if tt.wantErr != nil {
 				if err == nil {
 					t.Fatal("expected error")
@@ -1201,7 +1210,10 @@ func TestGoFetcherDirectDownload(t *testing.T) {
 			}
 			gf.env = append(gf.env, "GOPROXY="+proxyServer.URL)
 
-			infoFile, modFile, zipFile, err := gf.directDownload(t.Context(), tt.path, infoVersion)
+			infoFile, err1 := gf.directDownload(t.Context(), tt.path, infoVersion, ".info")
+			modFile, err2 := gf.directDownload(t.Context(), tt.path, infoVersion, ".mod")
+			zipFile, err3 := gf.directDownload(t.Context(), tt.path, infoVersion, ".zip")
+			err = firstError(err1, err2, err3)
 			if tt.wantErr != nil {
 				if err == nil {
 					t.Fatal("expected error")

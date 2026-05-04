@@ -16,7 +16,10 @@ mkdir -p bin
 if [ "${USE_GORELEASER_ARTIFACTS}" -eq 1 ]; then
 	cp -p "${TARGETPLATFORM}/bin/goproxy" bin/
 else
+    sed -i 's#https\?://dl-cdn.alpinelinux.org/alpine#https://mirrors.tuna.tsinghua.edu.cn/alpine#g' /etc/apk/repositories
+    apk update
 	apk add --no-cache git
+	export GOPROXY="https://goproxy.cn,direct"
 	go mod download
 	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/ ./cmd/goproxy
 fi
@@ -26,7 +29,8 @@ FROM ${GO_BASE_IMAGE}
 
 COPY --from=build /usr/local/src/goproxy/bin/ /usr/local/bin/
 
-RUN apk add --no-cache git git-lfs openssh gpg subversion fossil mercurial breezy
+RUN sed -i 's#https\?://dl-cdn.alpinelinux.org/alpine#https://mirrors.tuna.tsinghua.edu.cn/alpine#g' /etc/apk/repositories && apk update && \
+    apk add --no-cache git git-lfs openssh gpg subversion fossil mercurial breezy
 RUN git lfs install --system
 
 USER nobody
